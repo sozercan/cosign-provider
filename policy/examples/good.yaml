@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: good-deployment
+  labels:
+    app: good-deployment
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app:  good-deployment
+  template:
+    metadata:
+      labels:
+        app: good-deployment
+    spec:
+      containers:
+      - name: good-deployment
+        image: gcr.io/distroless/static:latest

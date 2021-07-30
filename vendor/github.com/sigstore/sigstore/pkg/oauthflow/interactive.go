@@ -27,8 +27,11 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/segmentio/ksuid"
 	"github.com/skratchdot/open-golang/open"
-	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
+)
+
+const (
+	oobRedirectURI = "urn:ietf:wg:oauth:2.0:oob"
 )
 
 // InteractiveIDTokenGetter is a type to get ID tokens for oauth flows
@@ -53,16 +56,20 @@ func (i *InteractiveIDTokenGetter) GetIDToken(p *oidc.Provider, cfg oauth2.Confi
 		return nil, err
 	}
 
-	authCodeURL := cfg.AuthCodeURL(stateToken, append(pkce.AuthURLOpts(), oauth2.AccessTypeOnline, oidc.Nonce(nonce))...)
-	fmt.Fprintf(os.Stderr, "Your browser will now be opened to:\n%s\n", authCodeURL)
+	opts := append(pkce.AuthURLOpts(), oauth2.AccessTypeOnline, oidc.Nonce(nonce))
+	authCodeURL := cfg.AuthCodeURL(stateToken, opts...)
+	var code string
 	if err := open.Run(authCodeURL); err != nil {
+		// Swap to the out of band flow if we can't open the browser
 		fmt.Fprintf(os.Stderr, "error opening browser: %v\n", err)
-		fmt.Fprintln(os.Stderr, "Please copy & paste the above URL into your browser to continue the authentication process...")
-	}
-
-	code, err := getCodeFromLocalServer(stateToken, redirectURL)
-	if err != nil {
-		return nil, err
+		code = doOobFlow(cfg, stateToken, opts)
+	} else {
+		fmt.Fprintf(os.Stderr, "Your browser will now be opened to:\n%s\n", authCodeURL)
+		code, err = getCodeFromLocalServer(stateToken, redirectURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error getting code from local server: %v\n", err)
+			code = doOobFlow(cfg, stateToken, opts)
+		}
 	}
 	token, err := cfg.Exchange(context.Background(), code, append(pkce.TokenURLOpts(), oidc.Nonce(nonce))...)
 	if err != nil {
@@ -76,7 +83,7 @@ func (i *InteractiveIDTokenGetter) GetIDToken(p *oidc.Provider, cfg oauth2.Confi
 	}
 
 	// verify nonce, client ID, access token hash before using it
-	verifier := p.Verifier(&oidc.Config{ClientID: viper.GetString("oidc-client-id")})
+	verifier := p.Verifier(&oidc.Config{ClientID: cfg.ClientID})
 	parsedIDToken, err := verifier.Verify(context.Background(), idToken)
 	if err != nil {
 		return nil, err
@@ -100,6 +107,16 @@ func (i *InteractiveIDTokenGetter) GetIDToken(p *oidc.Provider, cfg oauth2.Confi
 		Subject:   email,
 	}
 	return &returnToken, nil
+}
+
+func doOobFlow(cfg oauth2.Config, stateToken string, opts []oauth2.AuthCodeOption) string {
+	cfg.RedirectURL = oobRedirectURI
+	authURL := cfg.AuthCodeURL(stateToken, opts...)
+	fmt.Fprintln(os.Stderr, "Go to the following link in a browser:\n\n\t", authURL)
+	fmt.Fprintf(os.Stderr, "Enter verification code: ")
+	var code string
+	fmt.Scanln(&code)
+	return code
 }
 
 func getCodeFromLocalServer(state string, redirectURL *url.URL) (string, error) {

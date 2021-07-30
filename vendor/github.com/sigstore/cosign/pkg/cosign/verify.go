@@ -16,6 +16,7 @@
 package cosign
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -25,7 +26,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -35,19 +35,23 @@ import (
 	"github.com/go-openapi/swag"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/trillian/merkle/logverifier"
 	"github.com/google/trillian/merkle/rfc6962/hasher"
 	"github.com/pkg/errors"
 
-	"github.com/sigstore/rekor/cmd/rekor-cli/app"
+	cremote "github.com/sigstore/cosign/pkg/cosign/remote"
+	rekor "github.com/sigstore/rekor/pkg/client"
 	"github.com/sigstore/rekor/pkg/generated/client"
 	"github.com/sigstore/rekor/pkg/generated/client/entries"
+	"github.com/sigstore/rekor/pkg/generated/client/pubkey"
 	"github.com/sigstore/rekor/pkg/generated/models"
+	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/payload"
 )
 
-// This is rekor's public key, via `curl -L rekor.sigstore.dev/api/v1/log/publicKey`
+// This is rekor's public key, via `curl -L rekor.sigstore.dev/api/ggcrv1/log/publicKey`
 // rekor.pub should be updated whenever the Rekor public key is rotated & the bundle annotation should be up-versioned
 //go:embed rekor.pub
 var rekorPub string
@@ -135,105 +139,156 @@ func VerifyTLogEntry(rekorClient *client.Rekor, uuid string) (*models.LogEntryAn
 	if err := v.VerifyInclusionProof(*e.Verification.InclusionProof.LogIndex, *e.Verification.InclusionProof.TreeSize, hashes, rootHash, leafHash); err != nil {
 		return nil, errors.Wrap(err, "verifying inclusion proof")
 	}
+
+	// Verify rekor's signature over the SET.
+	resp, err := rekorClient.Pubkey.GetPublicKey(pubkey.NewGetPublicKeyParams())
+	if err != nil {
+		return nil, errors.Wrap(err, "rekor public key")
+	}
+	rekorPubKey, err := PemToECDSAKey([]byte(resp.Payload))
+	if err != nil {
+		return nil, errors.Wrap(err, "rekor public key pem to ecdsa")
+	}
+
+	payload := cremote.BundlePayload{
+		Body:           e.Body,
+		IntegratedTime: *e.IntegratedTime,
+		LogIndex:       *e.LogIndex,
+		LogID:          *e.LogID,
+	}
+	if err := VerifySET(payload, []byte(e.Verification.SignedEntryTimestamp), rekorPubKey); err != nil {
+		return nil, errors.Wrap(err, "verifying signedEntryTimestamp")
+	}
+
 	return &e, nil
 }
 
-// There are only payloads. Some have certs, some don't.
+// CheckOpts are the options for checking
 type CheckOpts struct {
-	Annotations  map[string]interface{}
-	Claims       bool
-	VerifyBundle bool
-	Tlog         bool
-	PubKey       PublicKey
-	Roots        *x509.CertPool
+	SignatureRepo        name.Repository
+	SigTagSuffixOverride string
+	RegistryClientOpts   []remote.Option
+
+	Annotations   map[string]interface{}
+	ClaimVerifier func(SignedPayload, v1.Hash, map[string]interface{}) error
+	VerifyBundle  bool
+
+	RekorURL string
+
+	SigVerifier signature.Verifier
+	VerifyOpts  []signature.VerifyOption
+	PKOpts      []signature.PublicKeyOption
+
+	RootCerts *x509.CertPool
 }
 
 // Verify does all the main cosign checks in a loop, returning validated payloads.
 // If there were no payloads, we return an error.
-func Verify(ctx context.Context, ref name.Reference, co *CheckOpts, rekorServerURL string) ([]SignedPayload, error) {
+func Verify(ctx context.Context, signedImgRef name.Reference, co *CheckOpts) ([]SignedPayload, error) {
 	// Enforce this up front.
-	if co.Roots == nil && co.PubKey == nil {
-		return nil, errors.New("one of public key or cert roots is required")
+	if co.RootCerts == nil && co.SigVerifier == nil {
+		return nil, errors.New("one of verifier or root certs is required")
 	}
-	// TODO: Figure out if we'll need a client before creating one.
-	rekorClient, err := app.GetRekorClient(rekorServerURL)
-	if err != nil {
-		return nil, err
+
+	// If the image ref contains the digest, use it.
+	// Otherwise, look up the digest the tag currently points to.
+	var h v1.Hash
+	if d, ok := signedImgRef.(name.Digest); ok {
+		var err error
+		h, err = v1.NewHash(d.DigestStr())
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		signedImgDesc, err := remote.Get(signedImgRef, co.RegistryClientOpts...)
+		if err != nil {
+			return nil, err
+		}
+		h = signedImgDesc.Descriptor.Digest
 	}
 
 	// These are all the signatures attached to our image that we know how to parse.
-	allSignatures, desc, err := FetchSignatures(ctx, ref)
+	sigRepo := co.SignatureRepo
+	if (sigRepo == name.Repository{}) {
+		sigRepo = signedImgRef.Context()
+	}
+	tagSuffix := SignatureTagSuffix
+	if co.SigTagSuffixOverride != "" {
+		tagSuffix = co.SigTagSuffixOverride
+	}
+
+	allSignatures, err := FetchSignaturesForImageDigest(ctx, h, sigRepo, tagSuffix, co.RegistryClientOpts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "fetching signatures")
 	}
 
 	validationErrs := []string{}
 	checkedSignatures := []SignedPayload{}
+	var rekorClient *client.Rekor
 	for _, sp := range allSignatures {
 		switch {
 		// We have a public key to check against.
-		case co.PubKey != nil:
-			if err := sp.VerifyKey(ctx, co.PubKey); err != nil {
+		case co.SigVerifier != nil:
+			if err := sp.VerifySignature(co.SigVerifier, co.VerifyOpts...); err != nil {
 				validationErrs = append(validationErrs, err.Error())
 				continue
 			}
 		// If we don't have a public key to check against, we can try a root cert.
-		case co.Roots != nil:
+		case co.RootCerts != nil:
 			// There might be signatures with a public key instead of a cert, though
 			if sp.Cert == nil {
 				validationErrs = append(validationErrs, "no certificate found on signature")
 				continue
 			}
-			pub := &signature.ECDSAVerifier{Key: sp.Cert.PublicKey.(*ecdsa.PublicKey), HashAlg: crypto.SHA256}
-			// Now verify the signature, then the cert.
-			if err := sp.VerifyKey(ctx, pub); err != nil {
+			pub, err := signature.LoadECDSAVerifier(sp.Cert.PublicKey.(*ecdsa.PublicKey), crypto.SHA256)
+			if err != nil {
+				validationErrs = append(validationErrs, "invalid certificate found on signature")
+				continue
+			}
+			// Now verify the cert, then the signature.
+			if err := sp.TrustedCert(co.RootCerts); err != nil {
 				validationErrs = append(validationErrs, err.Error())
 				continue
 			}
-			if err := sp.TrustedCert(co.Roots); err != nil {
+			if err := sp.VerifySignature(pub); err != nil {
 				validationErrs = append(validationErrs, err.Error())
 				continue
 			}
 		}
 
 		// We can't check annotations without claims, both require unmarshalling the payload.
-		if co.Claims {
-			ss := &payload.SimpleContainerImage{}
-			if err := json.Unmarshal(sp.Payload, ss); err != nil {
+		if co.ClaimVerifier != nil {
+			if err := co.ClaimVerifier(sp, h, co.Annotations); err != nil {
 				validationErrs = append(validationErrs, err.Error())
 				continue
-			}
-
-			if err := sp.VerifyClaims(desc, ss); err != nil {
-				validationErrs = append(validationErrs, err.Error())
-				continue
-			}
-
-			if co.Annotations != nil {
-				if !correctAnnotations(co.Annotations, ss.Optional) {
-					validationErrs = append(validationErrs, "missing or incorrect annotation")
-					continue
-				}
 			}
 		}
 
 		verified, err := sp.VerifyBundle()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Unable to verify offline (%v), checking tlog instead...", err)
+		if err != nil && co.RekorURL == "" {
+			validationErrs = append(validationErrs, "unable to verify bundle: "+err.Error())
+			continue
 		}
 		co.VerifyBundle = verified
 
-		if co.Tlog && !verified {
-			// Get the right public key to use (key or cert)
-			var pemBytes []byte
-			if co.PubKey != nil {
-				pemBytes, err = PublicKeyPem(ctx, co.PubKey)
+		if !verified && co.RekorURL != "" {
+			if rekorClient == nil {
+				rekorClient, err = rekor.GetRekorClient(co.RekorURL)
 				if err != nil {
-					validationErrs = append(validationErrs, err.Error())
+					validationErrs = append(validationErrs, "creating rekor client: "+err.Error())
 					continue
 				}
+			}
+			// Get the right public key to use (key or cert)
+			var pemBytes []byte
+			if co.SigVerifier != nil {
+				pemBytes, err = PublicKeyPem(co.SigVerifier, co.PKOpts...)
 			} else {
-				pemBytes = CertToPem(sp.Cert)
+				pemBytes, err = cryptoutils.MarshalCertificateToPEM(sp.Cert)
+			}
+			if err != nil {
+				validationErrs = append(validationErrs, err.Error())
+				continue
 			}
 
 			// Find the uuid then the entry.
@@ -244,12 +299,14 @@ func Verify(ctx context.Context, ref name.Reference, co *CheckOpts, rekorServerU
 			}
 
 			// if we have a cert, we should check expiry
+			// The IntegratedTime verified in VerifyTlog
 			if sp.Cert != nil {
 				e, err := getTlogEntry(rekorClient, uuid)
 				if err != nil {
 					validationErrs = append(validationErrs, err.Error())
 					continue
 				}
+
 				// Expiry check is only enabled with Tlog support
 				if err := checkExpiry(sp.Cert, time.Unix(*e.IntegratedTime, 0)); err != nil {
 					validationErrs = append(validationErrs, err.Error())
@@ -266,6 +323,7 @@ func Verify(ctx context.Context, ref name.Reference, co *CheckOpts, rekorServerU
 	}
 	return checkedSignatures, nil
 }
+
 func checkExpiry(cert *x509.Certificate, it time.Time) error {
 	ft := func(t time.Time) string {
 		return t.Format(time.RFC3339)
@@ -281,17 +339,17 @@ func checkExpiry(cert *x509.Certificate, it time.Time) error {
 	return nil
 }
 
-func (sp *SignedPayload) VerifyKey(ctx context.Context, pubKey PublicKey) error {
+func (sp *SignedPayload) VerifySignature(verifier signature.Verifier, verifyOpts ...signature.VerifyOption) error {
 	signature, err := base64.StdEncoding.DecodeString(sp.Base64Signature)
 	if err != nil {
 		return err
 	}
-	return pubKey.Verify(ctx, sp.Payload, signature)
+	return verifier.VerifySignature(bytes.NewReader(signature), bytes.NewReader(sp.Payload), verifyOpts...)
 }
 
-func (sp *SignedPayload) VerifyClaims(d *v1.Descriptor, ss *payload.SimpleContainerImage) error {
+func (sp *SignedPayload) VerifyClaims(digest v1.Hash, ss *payload.SimpleContainerImage) error {
 	foundDgst := ss.Critical.Image.DockerManifestDigest
-	if foundDgst != d.Digest.String() {
+	if foundDgst != digest.String() {
 		return fmt.Errorf("invalid or missing digest in claim: %s", foundDgst)
 	}
 	return nil
@@ -305,24 +363,9 @@ func (sp *SignedPayload) VerifyBundle() (bool, error) {
 	if err != nil {
 		return false, errors.Wrap(err, "pem to ecdsa")
 	}
-	le := &models.LogEntryAnon{
-		LogIndex:       sp.Bundle.LogIndex,
-		Body:           sp.Bundle.Body,
-		IntegratedTime: &sp.Bundle.IntegratedTime,
-		LogID:          &sp.Bundle.LogID,
-	}
-	contents, err := le.MarshalBinary()
-	if err != nil {
-		return false, errors.Wrap(err, "marshaling")
-	}
-	canonicalized, err := jsoncanonicalizer.Transform(contents)
-	if err != nil {
-		return false, errors.Wrap(err, "canonicalizing")
-	}
-	// verify the SET against the public key
-	hash := sha256.Sum256(canonicalized)
-	if !ecdsa.VerifyASN1(rekorPubKey, hash[:], []byte(sp.Bundle.SignedEntryTimestamp)) {
-		return false, fmt.Errorf("unable to verify")
+
+	if err := VerifySET(sp.Bundle.Payload, []byte(sp.Bundle.SignedEntryTimestamp), rekorPubKey); err != nil {
+		return false, err
 	}
 
 	if sp.Cert == nil {
@@ -330,10 +373,28 @@ func (sp *SignedPayload) VerifyBundle() (bool, error) {
 	}
 
 	// verify the cert against the integrated time
-	if err := checkExpiry(sp.Cert, time.Unix(sp.Bundle.IntegratedTime, 0)); err != nil {
+	if err := checkExpiry(sp.Cert, time.Unix(sp.Bundle.Payload.IntegratedTime, 0)); err != nil {
 		return false, errors.Wrap(err, "checking expiry on cert")
 	}
 	return true, nil
+}
+
+func VerifySET(bundlePayload cremote.BundlePayload, signature []byte, pub *ecdsa.PublicKey) error {
+	contents, err := json.Marshal(bundlePayload)
+	if err != nil {
+		return errors.Wrap(err, "marshaling")
+	}
+	canonicalized, err := jsoncanonicalizer.Transform(contents)
+	if err != nil {
+		return errors.Wrap(err, "canonicalizing")
+	}
+
+	// verify the SET against the public key
+	hash := sha256.Sum256(canonicalized)
+	if !ecdsa.VerifyASN1(pub, hash[:], signature) {
+		return fmt.Errorf("unable to verify")
+	}
+	return nil
 }
 
 func (sp *SignedPayload) VerifyTlog(rc *client.Rekor, publicKeyPem []byte) (uuid string, index int64, err error) {

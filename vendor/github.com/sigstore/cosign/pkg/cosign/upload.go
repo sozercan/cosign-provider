@@ -17,59 +17,18 @@ package cosign
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/pkg/errors"
 
 	"github.com/sigstore/rekor/pkg/generated/client"
 	"github.com/sigstore/rekor/pkg/generated/client/entries"
 	"github.com/sigstore/rekor/pkg/generated/models"
+	intoto_v001 "github.com/sigstore/rekor/pkg/types/intoto/v0.0.1"
 	rekord_v001 "github.com/sigstore/rekor/pkg/types/rekord/v0.0.1"
 )
-
-const (
-	repoEnv = "COSIGN_REPOSITORY"
-)
-
-func substituteRepo(img name.Reference) (name.Reference, error) {
-	wantRepo := os.Getenv(repoEnv)
-	if wantRepo == "" {
-		return img, nil
-	}
-	reg := img.Context().RegistryStr()
-	// strip registry from image
-	oldImage := strings.TrimPrefix(img.Name(), reg)
-	newSubrepo := strings.TrimPrefix(wantRepo, reg)
-
-	// replace old subrepo with new one
-	subRepo := strings.Split(oldImage, "/")
-	if s := strings.SplitAfterN(newSubrepo, "/", 1); len(s) == 1 {
-		subRepo[1] = strings.TrimPrefix(s[0], "/")
-	} else {
-		subRepo[1] = strings.TrimPrefix(s[1], "/")
-	}
-	newRepo := strings.Join(subRepo, "/")
-	// add the tag back in if we lost it
-	if dstTag, isTag := img.(name.Tag); isTag && !strings.Contains(newRepo, ":") {
-		newRepo = newRepo + ":" + dstTag.TagStr()
-	}
-	subbed := reg + newRepo
-	return name.ParseReference(subbed)
-}
-
-func SignaturesRef(signed name.Digest) (name.Reference, error) {
-	return substituteRepo(signed.Context().Tag(signatureImageTagForDigest(signed.DigestStr())))
-}
-
-func DestinationRef(ref name.Reference, img *remote.Descriptor) (name.Reference, error) {
-	dstTag := ref.Context().Tag(Munge(img.Descriptor))
-	return substituteRepo(dstTag)
-}
 
 // Upload will upload the signature, public key and payload to the tlog
 func UploadTLog(rekorClient *client.Rekor, signature, payload []byte, pemBytes []byte) (*models.LogEntryAnon, error) {
@@ -78,8 +37,21 @@ func UploadTLog(rekorClient *client.Rekor, signature, payload []byte, pemBytes [
 		APIVersion: swag.String(re.APIVersion()),
 		Spec:       re.RekordObj,
 	}
+	return doUpload(rekorClient, &returnVal)
+}
+
+func UploadAttestationTLog(rekorClient *client.Rekor, signature, pemBytes []byte) (*models.LogEntryAnon, error) {
+	e := intotoEntry(signature, pemBytes)
+	returnVal := models.Intoto{
+		APIVersion: swag.String(e.APIVersion()),
+		Spec:       e.IntotoObj,
+	}
+	return doUpload(rekorClient, &returnVal)
+}
+
+func doUpload(rekorClient *client.Rekor, pe models.ProposedEntry) (*models.LogEntryAnon, error) {
 	params := entries.NewCreateLogEntryParams()
-	params.SetProposedEntry(&returnVal)
+	params.SetProposedEntry(pe)
 	resp, err := rekorClient.Entries.CreateLogEntry(params)
 	if err != nil {
 		// If the entry already exists, we get a specific error.
@@ -98,6 +70,18 @@ func UploadTLog(rekorClient *client.Rekor, signature, payload []byte, pemBytes [
 		return &p, nil
 	}
 	return nil, errors.New("bad response from server")
+}
+
+func intotoEntry(signature, pubKey []byte) intoto_v001.V001Entry {
+	pub := strfmt.Base64(pubKey)
+	return intoto_v001.V001Entry{
+		IntotoObj: models.IntotoV001Schema{
+			Content: &models.IntotoV001SchemaContent{
+				Envelope: string(signature),
+			},
+			PublicKey: &pub,
+		},
+	}
 }
 
 func rekorEntry(payload, signature, pubKey []byte) rekord_v001.V001Entry {
