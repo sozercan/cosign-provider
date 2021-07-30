@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: good-deployment
+  name: signed-deployment
   labels:
-    app: good-deployment
+    app: signed-deployment
 spec:
   replicas: 0
   selector:
     matchLabels:
-      app:  good-deployment
+      app: signed-deployment
   template:
     metadata:
       labels:
-        app: good-deployment
+        app: signed-deployment
     spec:
       containers:
-      - name: good-deployment
+      - name: static
         image: gcr.io/distroless/static:latest

@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: bad-deployment
+  name: unsigned-deployment
   labels:
-    app: bad-deployment
+    app: unsigned-deployment
 spec:
   replicas: 0
   selector:
     matchLabels:
-      app:  bad-deployment
+      app: unsigned-deployment
   template:
     metadata:
       labels:
-        app: bad-deployment
+        app: unsigned-deployment
     spec:
       containers:
-      - name: bad-deployment
+      - name: pause
         image: gcr.io/google_containers/pause-amd64:3.0
