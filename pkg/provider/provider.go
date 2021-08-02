@@ -10,8 +10,8 @@ import (
 	"github.com/sigstore/sigstore/pkg/signature"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/sigstore/cosign/pkg/cosign"
 	"github.com/sigstore/cosign/cmd/cosign/cli/fulcio"
+	"github.com/sigstore/cosign/pkg/cosign"
 )
 
 func Signatures(ctx context.Context, img string, key *ecdsa.PublicKey) ([]cosign.SignedPayload, error) {

@@ -16,6 +16,9 @@ spec:
       - image: sozercan/cosign-provider:latest
         imagePullPolicy: Always
         name: cosign-provider
+        env:
+          - name: SECRET_NAME
+            value: "k8s://default/cosign-secret"
         ports:
         - containerPort: 8090
           protocol: TCP
