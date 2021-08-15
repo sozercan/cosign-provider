@@ -13,7 +13,7 @@ spec:
         run: cosign-provider
     spec:
       containers:
-      - image: sozercan/cosign-provider:latest
+      - image: sozercan/cosign-provider:v0.0.1
         imagePullPolicy: Always
         name: cosign-provider
         env:
