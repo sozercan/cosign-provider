@@ -8,15 +8,18 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
 	"github.com/sigstore/cosign/pkg/cosign/kubernetes"
 	"github.com/sozercan/cosign-provider/pkg/provider"
 	"go.uber.org/zap"
-	"github.com/go-logr/zapr"
 )
 
 var log logr.Logger
+
+const timeout = 3 * time.Second
 
 func main() {
 	zapLog, err := zap.NewDevelopment()
@@ -45,7 +48,9 @@ func validate(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	cfg, err := kubernetes.GetKeyPairSecret(ctx, secretKeyRef)
 	if err != nil {
 		log.Error(err, "unable to get key pair secret")
