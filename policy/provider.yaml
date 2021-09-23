@@ -5,5 +5,4 @@ metadata:
 spec:
   proxyURL: http://cosign-provider.default:8090/validate
   timeout: 3
-  failurePolicy: Fail
   maxRetry: 1

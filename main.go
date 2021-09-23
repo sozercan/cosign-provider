@@ -12,14 +12,18 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
+	"github.com/open-policy-agent/frameworks/constraint/pkg/externaldata"
 	"github.com/sigstore/cosign/pkg/cosign/kubernetes"
-	"github.com/sozercan/cosign-provider/pkg/provider"
+	"github.com/sozercan/cosign-provider/pkg/cosign"
 	"go.uber.org/zap"
 )
 
 var log logr.Logger
 
-const timeout = 3 * time.Second
+const (
+	timeout    = 3 * time.Second
+	apiVersion = "externaldata.gatekeeper.sh/v1alpha1"
+)
 
 func main() {
 	zapLog, err := zap.NewDevelopment()
@@ -38,13 +42,18 @@ func main() {
 }
 
 func validate(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
 	secretKeyRef := os.Getenv("SECRET_NAME")
 
-	body, err := ioutil.ReadAll(req.Body)
+	requestBody, err := ioutil.ReadAll(req.Body)
 	if err != nil {
 		log.Error(err, "unable to read request body")
+		return
+	}
+
+	var providerRequest externaldata.ProviderRequest
+	err = json.Unmarshal(requestBody, &providerRequest)
+	if err != nil {
+		log.Error(err, "unable to unmarshal request body")
 		return
 	}
 
@@ -57,26 +66,43 @@ func validate(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	keys := provider.Keys(cfg.Data)
+	publicKeys := cosign.Keys(cfg.Data)
 
-	if !valid(ctx, string(body), keys) {
-		w.WriteHeader(http.StatusOK)
-		if err = json.NewEncoder(w).Encode("invalid"); err != nil {
-			log.Error(err, "unable to encode output")
-			return
+	results := make([]externaldata.Item, 0)
+	for _, key := range providerRequest.Request.Keys {
+		isValid := checkSignature(ctx, key.(string), publicKeys)
+
+		if isValid {
+			results = append(results, externaldata.Item{
+				Key:   key.(string),
+				Value: true,
+			})
+		} else {
+			results = append(results, externaldata.Item{
+				Key:   key.(string),
+				Value: false,
+			})
 		}
-	} else {
-		w.WriteHeader(http.StatusOK)
-		if err = json.NewEncoder(w).Encode("valid"); err != nil {
-			log.Error(err, "unable to encode output")
-			return
-		}
+	}
+
+	response := externaldata.ProviderResponse{
+		APIVersion: apiVersion,
+		Kind:       "ProviderResponse",
+		Response: externaldata.Response{
+			Items: results,
+		},
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if err = json.NewEncoder(w).Encode(response); err != nil {
+		log.Error(err, "unable to encode output")
+		return
 	}
 }
 
-func valid(ctx context.Context, img string, keys []*ecdsa.PublicKey) bool {
+func checkSignature(ctx context.Context, img string, keys []*ecdsa.PublicKey) bool {
 	for _, k := range keys {
-		sps, err := provider.Signatures(ctx, img, k)
+		sps, err := cosign.Signatures(ctx, img, k)
 		if err != nil {
 			fmt.Printf("error while checking signature on image %s. error: %s\n", err, img)
 			return false

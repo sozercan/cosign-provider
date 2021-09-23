@@ -13,15 +13,9 @@ spec:
         package k8ssignedimages
 
         violation[{"msg": msg}] {
-          container := input_containers[_]
-          response := externaldata("cosign-provider", container.image)
-          contains(response, "invalid")
-          msg := sprintf("Image %v does not contain a valid cosign signature", [container.image])
-        }
-
-        input_containers[c] {
-            c := input.review.object.spec.template.spec.containers[_]
-        }
-        input_containers[c] {
-            c := input.review.object.spec.template.spec.initContainers[_]
+          images := [img | img = input.review.object.spec.template.spec.containers[_].image]
+          response := external_data({"provider": "cosign-provider", "keys": images})
+          result := response.responses[_]
+          result[1] == false
+          msg := sprintf("Image %v does not contain a valid cosign signature", [result[0]])
         }
