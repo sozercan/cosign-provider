@@ -19,10 +19,10 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: provider-cosign-sa
-  namespace: default
+  namespace: cosign-provider
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: provider-cosign-sa
-  namespace: default
+  namespace: cosign-provider

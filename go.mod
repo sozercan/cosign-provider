@@ -12,4 +12,5 @@ require (
 	go.uber.org/zap v1.18.1
 )
 
-replace github.com/open-policy-agent/frameworks/constraint => github.com/sozercan/frameworks/constraint v0.0.0-20210923005650-dc746bb01f6e
+// replace github.com/open-policy-agent/frameworks/constraint => github.com/sozercan/frameworks/constraint v0.0.0-20210923005650-dc746bb01f6e
+replace github.com/open-policy-agent/frameworks/constraint => /home/sozercan/go/src/github.com/open-policy-agent/frameworks/constraint

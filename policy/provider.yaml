@@ -3,6 +3,5 @@ kind: Provider
 metadata:
   name: cosign-provider
 spec:
-  proxyURL: http://cosign-provider.default:8090/validate
+  url: http://cosign-provider.cosign-provider:8090/validate
   timeout: 3
-  maxRetry: 1

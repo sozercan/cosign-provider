@@ -12,7 +12,7 @@ cosign-provider is used for validating whether images are signed with [cosign](h
   - Update `SECRET_NAME` environment variable
 
 - `kubectl apply -f policy/provider.yaml`
-  - Update `proxyURL` if it's not `http://cosign-provider.default:8090`
+  - Update `url` if it's not `http://cosign-provider.cosign-provider:8090`
 
 - `kubectl apply -f policy/template.yaml`
 
