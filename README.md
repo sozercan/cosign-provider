@@ -1,3 +1,9 @@
+❗ This repo is archived. Please use supported solutions such as:
+
+   - https://github.com/deislabs/ratify
+    
+   - https://github.com/sigstore/cosign-gatekeeper-provider
+
 # cosign-provider
 
 cosign-provider is used for validating whether images are signed with [cosign](https://github.com/sigstore/cosign).
